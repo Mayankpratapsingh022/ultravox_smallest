@@ -1,0 +1,15 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+websockets==12.0
+transformers==4.37.0
+torch==2.1.0
+torchaudio==2.1.0
+librosa==0.10.1
+soundfile==0.12.1
+pydub==0.25.1
+smallestai
+numpy==1.24.3
+python-multipart==0.0.6
+aiofiles==23.2.1
+python-dotenv==1.0.0
+accelerate==0.25.0

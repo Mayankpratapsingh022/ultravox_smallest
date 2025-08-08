@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice Agent</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        
+        #status {
+            padding: 10px;
+            margin-bottom: 20px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+        }
+        
+        #micButton {
+            width: 200px;
+            height: 60px;
+            font-size: 18px;
+            cursor: pointer;
+            margin-bottom: 20px;
+        }
+        
+        #micButton:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        #micButton.recording {
+            background-color: #ff4444;
+            color: white;
+        }
+        
+        #conversation {
+            border: 1px solid #ccc;
+            padding: 10px;
+            height: 300px;
+            overflow-y: auto;
+            margin-bottom: 20px;
+        }
+        
+        .message {
+            margin: 10px 0;
+            padding: 5px;
+        }
+        
+        .user {
+            text-align: right;
+            color: blue;
+        }
+        
+        .assistant {
+            text-align: left;
+            color: green;
+        }
+        
+        #debug {
+            font-family: monospace;
+            font-size: 12px;
+            background: #f0f0f0;
+            padding: 10px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+    </style>
+</head>
+<body>
+    <h1>Voice Agent</h1>
+    
+    <div id="status">Status: Connecting...</div>
+    
+    <button id="micButton" disabled>Press and Hold to Speak</button>
+    
+    <div id="conversation"></div>
+    
+    <div id="debug"></div>
+
+    <script>
+        // Configuration
+        const WS_URL = 'ws://localhost:8000/ws/voice';
+        let ws = null;
+        let mediaRecorder = null;
+        let audioChunks = [];
+        let isRecording = false;
+        let audioContext = null;
+        let audioQueue = [];
+        let isPlaying = false;
+
+        // Debug logging
+        function debug(msg) {
+            console.log(msg);
+            const debugDiv = document.getElementById('debug');
+            debugDiv.innerHTML += `${new Date().toISOString()}: ${msg}<br>`;
+            debugDiv.scrollTop = debugDiv.scrollHeight;
+        }
+
+        // Update status
+        function updateStatus(msg) {
+            document.getElementById('status').textContent = `Status: ${msg}`;
+            debug(msg);
+        }
+
+        // Add message to conversation
+        function addMessage(text, type) {
+            const conv = document.getElementById('conversation');
+            const msg = document.createElement('div');
+            msg.className = `message ${type}`;
+            msg.textContent = text;
+            conv.appendChild(msg);
+            conv.scrollTop = conv.scrollHeight;
+        }
+
+        // Initialize WebSocket
+        function connectWebSocket() {
+            updateStatus('Connecting to server...');
+            
+            ws = new WebSocket(WS_URL);
+            
+            ws.onopen = () => {
+                updateStatus('Connected');
+                document.getElementById('micButton').disabled = false;
+            };
+            
+            ws.onmessage = async (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    debug(`Received: ${data.type}`);
+                    
+                    switch(data.type) {
+                        case 'connection_established':
+                            updateStatus('Ready');
+                            break;
+                            
+                        case 'response_text':
+                            addMessage(data.text, 'assistant');
+                            break;
+                            
+                        case 'audio_chunk':
+                            // Store audio chunk
+                            audioQueue.push(data.audio);
+                            debug(`Audio chunk received: ${data.chunk_index}`);
+                            
+                            // Start playing if not already playing
+                            if (!isPlaying && audioQueue.length > 0) {
+                                playAudioQueue();
+                            }
+                            break;
+                            
+                        case 'audio_complete':
+                            debug(`Audio complete: ${data.total_chunks} chunks`);
+                            break;
+                            
+                        case 'error':
+                            debug(`Error: ${data.message}`);
+                            updateStatus(`Error: ${data.message}`);
+                            break;
+                    }
+                } catch (e) {
+                    debug(`Error parsing message: ${e}`);
+                }
+            };
+            
+            ws.onerror = (error) => {
+                debug(`WebSocket error: ${error}`);
+                updateStatus('Connection error');
+            };
+            
+            ws.onclose = () => {
+                updateStatus('Disconnected - Reconnecting in 3s...');
+                document.getElementById('micButton').disabled = true;
+                setTimeout(connectWebSocket, 3000);
+            };
+        }
+
+        // Initialize audio context
+        async function initAudio() {
+            try {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                debug('Audio context initialized');
+                
+                // Request microphone permission
+                await navigator.mediaDevices.getUserMedia({ audio: true });
+                debug('Microphone permission granted');
+            } catch (e) {
+                debug(`Audio init error: ${e}`);
+                updateStatus('Microphone access denied');
+            }
+        }
+
+        // Start recording
+        async function startRecording() {
+            if (isRecording) return;
+            
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        channelCount: 1,
+                        sampleRate: 16000,
+                        echoCancellation: true,
+                        noiseSuppression: true
+                    }
+                });
+                
+                mediaRecorder = new MediaRecorder(stream);
+                audioChunks = [];
+                
+                mediaRecorder.ondataavailable = (event) => {
+                    if (event.data.size > 0) {
+                        audioChunks.push(event.data);
+                    }
+                };
+                
+                mediaRecorder.onstop = async () => {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                    debug(`Recorded ${audioBlob.size} bytes`);
+                    
+                    // Convert to base64 and send
+                    const reader = new FileReader();
+                    reader.onloadend = () => {
+                        const base64 = reader.result.split(',')[1];
+                        
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({
+                                type: 'audio',
+                                audio: base64
+                            }));
+                            debug('Audio sent to server');
+                            addMessage('[Voice input sent]', 'user');
+                        }
+                    };
+                    reader.readAsDataURL(audioBlob);
+                    
+                    // Stop all tracks
+                    stream.getTracks().forEach(track => track.stop());
+                };
+                
+                mediaRecorder.start();
+                isRecording = true;
+                
+                document.getElementById('micButton').classList.add('recording');
+                document.getElementById('micButton').textContent = 'Recording... Release to send';
+                updateStatus('Recording...');
+                
+            } catch (e) {
+                debug(`Recording error: ${e}`);
+                updateStatus('Recording failed');
+            }
+        }
+
+        // Stop recording
+        function stopRecording() {
+            if (!isRecording) return;
+            
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+                isRecording = false;
+                
+                document.getElementById('micButton').classList.remove('recording');
+                document.getElementById('micButton').textContent = 'Press and Hold to Speak';
+                updateStatus('Processing...');
+            }
+        }
+
+        // Play audio queue
+        async function playAudioQueue() {
+            if (audioQueue.length === 0) {
+                isPlaying = false;
+                return;
+            }
+            
+            isPlaying = true;
+            const audioBase64 = audioQueue.shift();
+            
+            try {
+                // Method 1: Direct Audio element (best for WAV with headers)
+                const audio = new Audio(`data:audio/wav;base64,${audioBase64}`);
+                
+                audio.onended = () => {
+                    debug('Audio chunk finished');
+                    playAudioQueue(); // Play next chunk
+                };
+                
+                audio.onerror = (e) => {
+                    debug(`Audio element error: ${e}`);
+                    // Try alternative method
+                    playAudioWithContext(audioBase64);
+                };
+                
+                await audio.play();
+                debug('Playing audio chunk via Audio element');
+                
+            } catch (e) {
+                debug(`Direct audio playback error: ${e}`);
+                // Try with AudioContext
+                playAudioWithContext(audioBase64);
+            }
+        }
+        
+        // Alternative playback method using AudioContext
+        async function playAudioWithContext(audioBase64) {
+            try {
+                // Decode base64 to array buffer
+                const audioData = atob(audioBase64);
+                const arrayBuffer = new ArrayBuffer(audioData.length);
+                const view = new Uint8Array(arrayBuffer);
+                
+                for (let i = 0; i < audioData.length; i++) {
+                    view[i] = audioData.charCodeAt(i);
+                }
+                
+                // Decode audio data (handles WAV format)
+                const audioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice(0));
+                
+                // Create and play source
+                const source = audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(audioContext.destination);
+                
+                source.onended = () => {
+                    debug('Audio context playback finished');
+                    playAudioQueue(); // Play next chunk
+                };
+                
+                source.start(0);
+                debug('Playing audio chunk via AudioContext');
+                
+            } catch (e) {
+                debug(`AudioContext playback error: ${e}`);
+                // Skip this chunk and continue
+                setTimeout(playAudioQueue, 100);
+            }
+        }
+
+        // Setup event listeners
+        function setupEventListeners() {
+            const micButton = document.getElementById('micButton');
+            
+            // Mouse events
+            micButton.addEventListener('mousedown', startRecording);
+            micButton.addEventListener('mouseup', stopRecording);
+            micButton.addEventListener('mouseleave', stopRecording);
+            
+            // Touch events for mobile
+            micButton.addEventListener('touchstart', (e) => {
+                e.preventDefault();
+                startRecording();
+            });
+            micButton.addEventListener('touchend', (e) => {
+                e.preventDefault();
+                stopRecording();
+            });
+            
+            // Keyboard shortcut (spacebar)
+            document.addEventListener('keydown', (e) => {
+                if (e.code === 'Space' && !isRecording) {
+                    e.preventDefault();
+                    startRecording();
+                }
+            });
+            
+            document.addEventListener('keyup', (e) => {
+                if (e.code === 'Space' && isRecording) {
+                    e.preventDefault();
+                    stopRecording();
+                }
+            });
+        }
+
+        // Initialize everything
+        async function init() {
+            debug('Initializing...');
+            await initAudio();
+            setupEventListeners();
+            connectWebSocket();
+        }
+
+        // Start when page loads
+        window.addEventListener('DOMContentLoaded', init);
+    </script>
+</body>
+</html>
